@@ -30,6 +30,7 @@
  * SOFTWARE.
  */
 
+#include <stdio.h>
 #include <stdlib.h>
 #include "clock_face.h"
 #include "watch.h"
@@ -42,6 +43,12 @@
 #define CLOCK_FACE_LOW_BATTERY_VOLTAGE_THRESHOLD 2200
 #endif
 
+// Countdown cycle: 5 -> 10 -> 15 -> 30 -> 0 (cancel/off) -> 5 ...
+static const uint8_t clock_countdown_cycle[] = { 5, 10, 15, 30, 0 };
+#define CLOCK_COUNTDOWN_CYCLE_LEN (sizeof(clock_countdown_cycle) / sizeof(clock_countdown_cycle[0]))
+#define CLOCK_COUNTDOWN_CANCEL_SECONDS 3    // how long to show "--" after a cancel
+#define CLOCK_COUNTDOWN_ALARM_BEEPS 8       // ~8 seconds of buzzer when the timer fires
+
 typedef struct {
     struct {
         watch_date_time previous;
@@ -50,6 +57,12 @@ typedef struct {
     uint8_t watch_face_index;
     bool time_signal_enabled;
     bool battery_low;
+    struct {
+        uint8_t cycle_index;       // index into clock_countdown_cycle of the *next* value to apply
+        uint8_t minutes;           // 0 = inactive; otherwise the currently-running duration
+        uint32_t target_ts;        // unix timestamp when the countdown fires
+        uint32_t cancel_until_ts;  // 0 = no cancel banner; otherwise show "--" until this unix ts
+    } countdown;
 } clock_state_t;
 
 static bool clock_is_in_24h_mode(movement_settings_t *settings) {
@@ -188,6 +201,69 @@ static void clock_display_clock(movement_settings_t *settings, clock_state_t *cl
     }
 }
 
+static inline int32_t clock_tz_offset(movement_settings_t *settings) {
+    return movement_timezone_offsets[settings->bit.time_zone] * 60;
+}
+
+static inline uint32_t clock_now_ts(movement_settings_t *settings) {
+    return watch_utility_date_time_to_unix_time(watch_rtc_get_date_time(), clock_tz_offset(settings));
+}
+
+static void clock_countdown_overlay(clock_state_t *clock, watch_date_time current,
+                                    movement_settings_t *settings) {
+    if (clock->countdown.minutes != 0) {
+        uint32_t now_ts = watch_utility_date_time_to_unix_time(current, clock_tz_offset(settings));
+        uint32_t remaining_min;
+        if (now_ts >= clock->countdown.target_ts) {
+            remaining_min = 0;
+        } else {
+            // Round up so we show "1" during the final minute instead of "0".
+            remaining_min = (clock->countdown.target_ts - now_ts + 59) / 60;
+        }
+        char buf[3];
+        snprintf(buf, sizeof(buf), "%2lu", (unsigned long) remaining_min);
+        watch_display_string(buf, 2);
+        // Per timer_face's convention: blink the BELL indicator each second to
+        // signal "countdown active", while keeping the digits stable and readable.
+        clock_indicate(WATCH_INDICATOR_BELL, (current.unit.second % 2) == 0);
+    } else if (clock->countdown.cancel_until_ts != 0) {
+        // Position 2 (day-tens) shares top/middle/bottom segments on the F-91W LCD,
+        // so a "-" there lights up as three bars. Use blank-then-dash instead.
+        watch_display_string(" -", 2);
+    }
+}
+
+static void clock_countdown_start(clock_state_t *clock, movement_settings_t *settings, uint8_t minutes) {
+    clock->countdown.minutes = minutes;
+    clock->countdown.cancel_until_ts = 0;
+    uint32_t now_ts = clock_now_ts(settings);
+    clock->countdown.target_ts = watch_utility_offset_timestamp(now_ts, 0, minutes, 0);
+    watch_date_time target_dt = watch_utility_date_time_from_unix_time(clock->countdown.target_ts, clock_tz_offset(settings));
+    movement_schedule_background_task_for_face(clock->watch_face_index, target_dt);
+}
+
+static void clock_countdown_cancel(clock_state_t *clock, movement_settings_t *settings) {
+    clock->countdown.minutes = 0;
+    clock->countdown.target_ts = 0;
+    clock->countdown.cancel_until_ts = clock_now_ts(settings) + CLOCK_COUNTDOWN_CANCEL_SECONDS;
+    movement_cancel_background_task_for_face(clock->watch_face_index);
+    // Restore the BELL indicator to reflect the hourly-chime setting.
+    clock_indicate_time_signal(clock);
+    // Force a full redraw so the day position can be overlaid with "--".
+    clock->date_time.previous.reg = 0xFFFFFFFF;
+}
+
+static void clock_countdown_advance(clock_state_t *clock, movement_settings_t *settings) {
+    uint8_t next = clock_countdown_cycle[clock->countdown.cycle_index];
+    clock->countdown.cycle_index = (clock->countdown.cycle_index + 1) % CLOCK_COUNTDOWN_CYCLE_LEN;
+
+    if (next == 0) {
+        clock_countdown_cancel(clock, settings);
+    } else {
+        clock_countdown_start(clock, settings, next);
+    }
+}
+
 static void clock_display_low_energy(watch_date_time date_time) {
     char buf[10 + 1];
 
@@ -225,6 +301,10 @@ void clock_face_setup(movement_settings_t *settings, uint8_t watch_face_index, v
         clock_state_t *state = (clock_state_t *) *context_ptr;
         state->time_signal_enabled = false;
         state->watch_face_index = watch_face_index;
+        state->countdown.cycle_index = 0;
+        state->countdown.minutes = 0;
+        state->countdown.target_ts = 0;
+        state->countdown.cancel_until_ts = 0;
     }
 }
 
@@ -250,23 +330,56 @@ bool clock_face_loop(movement_event_t event, movement_settings_t *settings, void
     switch (event.event_type) {
         case EVENT_LOW_ENERGY_UPDATE:
             clock_start_tick_tock_animation();
-            clock_display_low_energy(watch_rtc_get_date_time());
+            current = watch_rtc_get_date_time();
+            clock_display_low_energy(current);
+            clock_countdown_overlay(state, current, settings);
             break;
         case EVENT_TICK:
         case EVENT_ACTIVATE:
             current = watch_rtc_get_date_time();
 
+            // Expire the post-cancel "--" banner so the date can come back.
+            if (state->countdown.cancel_until_ts != 0) {
+                uint32_t now_ts = watch_utility_date_time_to_unix_time(current, clock_tz_offset(settings));
+                if (now_ts >= state->countdown.cancel_until_ts) {
+                    state->countdown.cancel_until_ts = 0;
+                    state->date_time.previous.reg = 0xFFFFFFFF;
+                }
+            }
+
             clock_display_clock(settings, state, current);
+            clock_countdown_overlay(state, current, settings);
 
             clock_check_battery_periodically(state, current);
 
             state->date_time.previous = current;
 
             break;
+        case EVENT_ALARM_BUTTON_UP:
+            clock_countdown_advance(state, settings);
+            // Redraw immediately so the new countdown value (or "--" banner) appears.
+            current = watch_rtc_get_date_time();
+            clock_display_clock(settings, state, current);
+            clock_countdown_overlay(state, current, settings);
+            state->date_time.previous = current;
+            break;
         case EVENT_ALARM_LONG_PRESS:
             clock_toggle_time_signal(state);
             break;
         case EVENT_BACKGROUND_TASK:
+            if (state->countdown.minutes != 0) {
+                uint32_t now_ts = watch_utility_date_time_to_unix_time(watch_rtc_get_date_time(), clock_tz_offset(settings));
+                if (now_ts >= state->countdown.target_ts) {
+                    movement_play_alarm_beeps(CLOCK_COUNTDOWN_ALARM_BEEPS, BUZZER_NOTE_C8);
+                    state->countdown.minutes = 0;
+                    state->countdown.target_ts = 0;
+                    state->countdown.cycle_index = 0;
+                    state->countdown.cancel_until_ts = 0;
+                    clock_indicate_time_signal(state);
+                    state->date_time.previous.reg = 0xFFFFFFFF;
+                    break;
+                }
+            }
             // uncomment this line to snap back to the clock face when the hour signal sounds:
             // movement_move_to_face(state->watch_face_index);
             movement_play_signal();

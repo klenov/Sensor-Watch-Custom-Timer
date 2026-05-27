@@ -39,6 +39,12 @@
  *
  * Long-press ALARM to toggle the hourly chime.
  *
+ * Short-press ALARM to cycle a quick countdown timer in the day-of-month
+ * digits: 5 -> 10 -> 15 -> 30 minutes -> off. Each press immediately
+ * (re)starts the countdown with the new duration; while running, the BELL
+ * indicator blinks once per second, and the buzzer fires when the timer
+ * reaches zero.
+ *
  */
 
 #include "movement.h"
