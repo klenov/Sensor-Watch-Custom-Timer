@@ -1,6 +1,20 @@
 The Sensor Watch
 ================
 
+## This fork: quick countdown timer on the clock face
+
+This fork adds a built-in countdown timer to the default clock face, so you don't have to switch faces to set a quick timer.
+
+* Short-press **ALARM** to cycle the day-of-month digits through `5 → 10 → 15 → 30 minutes → off (–) → 5 → …`
+* Each press immediately (re)starts the countdown with the new duration.
+* While the timer is running, the **BELL** indicator blinks once per second.
+* When the timer reaches zero the buzzer sounds for about eight seconds.
+* Long-press **ALARM** still toggles the hourly chime, unchanged from upstream.
+
+All other watch faces are untouched. See `movement/watch_faces/clock/clock_face.c` for the implementation.
+
+---
+
 The [Sensor Watch](https://www.sensorwatch.net) is a board replacement for the classic Casio F-91W wristwatch. It is powered by a Microchip SAM L22 microcontroller with built-in segment LCD controller. You can write your own programs for the watch using the provided watch library, program the watch over USB using the built-in UF2 bootloader, and then install the board in your existing watch case to run your own software on your wrist.
 
 ![image](/images/sensor-watch.jpg)
